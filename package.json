@@ -1,0 +1,49 @@
+{
+  "name": "poly-sdk",
+  "version": "1.0.0",
+  "description": "Poly SDK — Survive third-party API changes. Detect schema drift, generate safe mappings, apply transformations locally.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Tests coming soon\" && exit 0"
+  },
+  "keywords": [
+    "poly",
+    "api",
+    "schema",
+    "drift",
+    "breaking-changes",
+    "axios",
+    "monitoring",
+    "auto-patch",
+    "third-party-api"
+  ],
+  "author": "Poly",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pritahi121/poly-sdk"
+  },
+  "homepage": "https://github.com/Pritahi121/poly-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/Pritahi121/poly-sdk/issues"
+  },
+  "peerDependencies": {
+    "axios": ">=0.21.0"
+  },
+  "peerDependenciesMeta": {
+    "axios": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "axios": "^1.6.0"
+  }
+}
