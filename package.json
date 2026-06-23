@@ -1,6 +1,6 @@
 {
   "name": "pritpolytt-sdk",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Poly SDK — Survive third-party API changes. Detect schema drift, generate safe mappings, apply transformations locally.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
