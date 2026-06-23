@@ -99,7 +99,7 @@ export interface AxiosInstance {
   delete<T = unknown>(url: string, config?: Record<string, unknown>): Promise<{ data: T; status: number; statusText: string; headers: Record<string, string>; config: Record<string, unknown> }>;
   interceptors: {
     request: { use: (fulfilled?: (config: Record<string, unknown>) => Record<string, unknown>, rejected?: (error: unknown) => unknown) => number; eject: (id: number) => void };
-    response: { use: (fulfilled?: (response: AxiosResponse) => AxiosResponse, rejected?: (error: unknown) => unknown) => number; eject: (id: number) => void };
+    response: { use: (fulfilled?: (response: AxiosResponse) => AxiosResponse | Promise<AxiosResponse>, rejected?: (error: unknown) => unknown) => number; eject: (id: number) => void };
   };
   defaults: Record<string, unknown>;
 }
