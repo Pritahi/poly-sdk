@@ -7,14 +7,15 @@
 ## Install
 
 ```bash
-# Direct from GitHub (no login needed)
 npm install github:Pritahi121/poly-sdk
 ```
+
+> 💡 **Prerequisite:** Git must be installed. No GitHub account or token needed — this is a public repo.
 
 ## Quick Start
 
 ```typescript
-import { Poly } from "poly-sdk"
+import { Poly } from "pritpolytt-sdk"
 import axios from "axios"
 
 // 1. Initialize with your API key
@@ -25,9 +26,11 @@ Poly.init({
 // 2. Wrap your HTTP client
 Poly.wrap(axios)
 
-// That's it! All responses are now monitored.
-// Schema drift is detected and patched automatically.
+// 3. Use your API normally — Poly handles everything else
+const { data } = await axios.get("https://api.example.com/users")
 ```
+
+That's it. 3 lines. Poly automatically monitors, detects drift, and patches responses.
 
 ## How It Works
 
