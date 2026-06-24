@@ -7,7 +7,8 @@
 ## Install
 
 ```bash
-npm install poly-sdk
+# Direct from GitHub (no login needed)
+npm install github:Pritahi121/poly-sdk
 ```
 
 ## Quick Start
