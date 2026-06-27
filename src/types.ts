@@ -7,8 +7,6 @@ export interface PolyConfig {
   dryRun?: boolean;
   disable?: boolean;
   rules?: RuleDefinition[];
-  openApiSpec?: Record<string, unknown>;
-  zodSchemas?: Record<string, unknown>;
   onDrift?: (event: DriftEvent) => void;
   onPatch?: (patch: PatchOperation) => void;
   onError?: (error: Error) => void;

@@ -2,8 +2,16 @@
 // npm install poly-sdk
 //
 // import { Poly } from "poly-sdk"
+//
+// // Simple (singleton):
 // Poly.init({ apiKey: "poly_live_xxx" })
 // Poly.wrap(axios)
+//
+// // Multi-instance:
+// const poly1 = Poly.createInstance({ apiKey: "key_1" })
+// const poly2 = Poly.createInstance({ apiKey: "key_2" })
+// poly1.wrap(axios1)
+// poly2.wrapFetch()
 
 import {
   PolyConfig,
@@ -11,11 +19,10 @@ import {
   PatchOperation,
   DriftAnalysisResponse,
   AxiosInstance,
-  RuleDefinition,
   SchemaField,
 } from "./types";
 
-import { inferSchema, detectDrift, serializeSchema, DriftResult } from "./schema";
+import { inferSchema, detectDrift, serializeSchema } from "./schema";
 import { applyPatches } from "./transformer";
 import {
   generateCacheKey,
@@ -32,522 +39,419 @@ import {
 const DEFAULT_ENDPOINT = "https://api.poly.dev";
 const DEFAULT_CONFIDENCE_THRESHOLD = 98;
 
-// Singleton state
-let config: PolyConfig | null = null;
-let baselineSchemas = new Map<string, SchemaField[]>();
-let disabled = false;
-let originalFetch: typeof fetch | null = null;
-
-// Event listeners
 type Listener = (event: DriftEvent | PatchOperation | Error) => void;
-const listeners = new Map<string, Listener[]>();
 
-function emit(event: string, data: unknown): void {
-  const cbs = listeners.get(event) || [];
-  for (const cb of cbs) cb(data as never);
-}
+// ═══════════════════════════════════════════════
+// PolyInstance — fully isolated instance
+// ═══════════════════════════════════════════════
+export class PolyInstance {
+  private config: PolyConfig | null = null;
+  private baselineSchemas = new Map<string, SchemaField[]>();
+  private disabled = false;
+  private originalFetch: typeof fetch | null = null;
+  private listeners = new Map<string, Listener[]>();
+  private offlineQueue: Array<{ endpoint: string; method: string; expected: SchemaField[]; actual: SchemaField[]; timestamp: number }> = [];
+  private queueMaxSize = 100;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushing = false;
 
-function isDisabled(): boolean {
-  if (disabled) return true;
-  if (config?.disable) return true;
-  if (typeof process !== "undefined" && process.env.POLY_DISABLE === "1") return true;
-  return false;
-}
-
-function getEndpoint(): string {
-  return config?.endpoint || DEFAULT_ENDPOINT;
-}
-
-function getConfidenceThreshold(): number {
-  return config?.confidenceThreshold ?? DEFAULT_CONFIDENCE_THRESHOLD;
-}
-
-// ─── PUBLIC API ────────────────────────────────────────────
-
-export const Poly = {
-  /**
-   * Initialize the Poly SDK with your API key and options
-   */
+  // ─── Init ───
   init(options: PolyConfig): void {
-    config = options;
-    disabled = false;
-    baselineSchemas.clear();
-  },
+    this.config = options;
+    this.disabled = false;
+    this.baselineSchemas.clear();
+  }
 
-  /**
-   * Wrap an Axios instance to intercept responses and detect drift
-   */
+  // ─── Helpers ───
+  private emit(event: string, data: unknown): void {
+    const cbs = this.listeners.get(event) || [];
+    for (const cb of cbs) cb(data as never);
+  }
+
+  private isDisabled(): boolean {
+    if (this.disabled) return true;
+    if (this.config?.disable) return true;
+    if (typeof process !== "undefined" && process.env.POLY_DISABLE === "1") return true;
+    return false;
+  }
+
+  private getEndpoint(): string {
+    return this.config?.endpoint || DEFAULT_ENDPOINT;
+  }
+
+  private getConfidenceThreshold(): number {
+    return this.config?.confidenceThreshold ?? DEFAULT_CONFIDENCE_THRESHOLD;
+  }
+
+  // ─── Axios ───
   wrap(axios: AxiosInstance): AxiosInstance {
-    if (isDisabled()) return axios;
+    if (this.isDisabled()) return axios;
 
-    // Add response interceptor
     axios.interceptors.response.use(
       async (response) => {
-        await handleResponse(response.config as Record<string, unknown>, response.data);
+        await this.handleResponse(response.config as Record<string, unknown>, response.data);
         return response;
       },
       (error) => {
-        if (config?.onError) config.onError(error instanceof Error ? error : new Error(String(error)));
+        if (this.config?.onError) this.config.onError(error instanceof Error ? error : new Error(String(error)));
         return Promise.reject(error);
       }
     );
-
     return axios;
-  },
+  }
 
-  /**
-   * Wrap the global fetch function to intercept responses and detect drift.
-   * Works with native fetch, node-fetch, undici, etc.
-   *
-   * @example
-   * Poly.wrapFetch()
-   * const res = await fetch("https://api.example.com/users")
-   * const data = await res.json() // automatically drift-protected
-   */
+  // ─── Fetch ───
   wrapFetch(): typeof fetch {
-    if (isDisabled()) return fetch.bind(typeof globalThis !== "undefined" ? globalThis : global);
-
-    // Save original fetch before replacing
-    if (!originalFetch) {
-      originalFetch = (typeof globalThis !== "undefined" ? globalThis.fetch : global.fetch);
+    if (this.isDisabled()) return fetch.bind(typeof globalThis !== "undefined" ? globalThis : global);
+    if (!this.originalFetch) {
+      this.originalFetch = (typeof globalThis !== "undefined" ? globalThis.fetch : (global as any).fetch);
     }
+    const self = this;
+    const orig = this.originalFetch;
 
     const polyFetch = async (input: string | URL, init?: RequestInit): Promise<Response> => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
       const method = init?.method?.toUpperCase() || "GET";
-
-      // Call original fetch
-      const response = await originalFetch!(input, init);
-
-      // Only process JSON responses
+      const response = await orig!(input, init);
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("json")) return response;
-
-      // Clone so we can read body without consuming it
       const clone = response.clone();
-
       try {
         const bodyText = await clone.text();
         let responseData: unknown;
         try { responseData = JSON.parse(bodyText); } catch { return response; }
-
         if (!responseData || typeof responseData !== "object") return response;
-
-        // Run drift detection (may patch in-place via handleResponse)
-        const patchedData = await handleFetchResponse(
-          { url, method },
-          JSON.parse(JSON.stringify(responseData)) // deep copy for analysis
-        );
-
+        const patchedData = await self.handleFetchResponse({ url, method }, JSON.parse(JSON.stringify(responseData)));
         if (patchedData) {
-          // Patches applied — return new Response with modified body
-          return new Response(JSON.stringify(patchedData), {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          });
+          return new Response(JSON.stringify(patchedData), { status: response.status, statusText: response.statusText, headers: response.headers });
         }
-
         return response;
-      } catch {
-        return response; // If anything fails, return original
-      }
+      } catch { return response; }
     };
 
-    // Replace global fetch
-    if (typeof globalThis !== "undefined") {
-      (globalThis as Record<string, unknown>).fetch = polyFetch as typeof fetch;
-    } else {
-      (global as Record<string, unknown>).fetch = polyFetch as typeof fetch;
-    }
+    if (typeof globalThis !== "undefined") (globalThis as any).fetch = polyFetch;
+    else (global as any).fetch = polyFetch;
+    return polyFetch as any;
+  }
 
-    return polyFetch as unknown as typeof fetch;
-  },
-
-  /**
-   * Create a stand-alone Poly-wrapped fetch without replacing the global.
-   * Use this when you want to keep the original fetch available.
-   *
-   * @example
-   * const polyFetch = Poly.createFetch()
-   * const res = await polyFetch("https://api.example.com/users")
-   */
   createFetch(): typeof fetch {
-    const baseFetch = (typeof globalThis !== "undefined" ? globalThis.fetch : global.fetch).bind(globalThis || global);
+    const baseFetch = (typeof globalThis !== "undefined" ? globalThis.fetch : (global as any).fetch).bind(globalThis || global);
+    const self = this;
 
     return (async (input: string | URL, init?: RequestInit): Promise<Response> => {
-      if (isDisabled()) return baseFetch(input, init);
-
+      if (self.isDisabled()) return baseFetch(input, init);
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
       const method = init?.method?.toUpperCase() || "GET";
-
       const response = await baseFetch(input, init);
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("json")) return response;
-
       const clone = response.clone();
       try {
         const bodyText = await clone.text();
         let responseData: unknown;
         try { responseData = JSON.parse(bodyText); } catch { return response; }
         if (!responseData || typeof responseData !== "object") return response;
-
-        const patchedData = await handleFetchResponse(
-          { url, method },
-          JSON.parse(JSON.stringify(responseData))
-        );
-
+        const patchedData = await self.handleFetchResponse({ url, method }, JSON.parse(JSON.stringify(responseData)));
         if (patchedData) {
-          return new Response(JSON.stringify(patchedData), {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          });
+          return new Response(JSON.stringify(patchedData), { status: response.status, statusText: response.statusText, headers: response.headers });
         }
         return response;
-      } catch {
-        return response;
-      }
-    }) as unknown as typeof fetch;
-  },
+      } catch { return response; }
+    }) as any;
+  }
 
-  /**
-   * Restore the original global fetch (undo Poly.wrapFetch)
-   */
   unwrapFetch(): void {
-    if (originalFetch) {
-      if (typeof globalThis !== "undefined") {
-        (globalThis as Record<string, unknown>).fetch = originalFetch;
-      } else {
-        (global as Record<string, unknown>).fetch = originalFetch;
-      }
-      originalFetch = null;
+    if (this.originalFetch) {
+      if (typeof globalThis !== "undefined") (globalThis as any).fetch = this.originalFetch;
+      else (global as any).fetch = this.originalFetch;
+      this.originalFetch = null;
     }
-  },
+  }
 
-  /**
-   * Manually process a response (for non-Axios clients)
-   */
+  // ─── Manual analysis ───
   analyzeResponse(requestConfig: Record<string, unknown>, responseData: unknown): void {
-    if (isDisabled()) return;
-    handleResponse(requestConfig, responseData);
-  },
+    if (this.isDisabled()) return;
+    this.handleResponse(requestConfig, responseData);
+  }
 
-  /**
-   * Invalidate cache for a specific endpoint
-   */
+  // ─── Cache ───
   invalidateCache(endpoint: string): number {
-    if (!config) return 0;
-    return invalidateEndpoint(config.apiKey, endpoint);
-  },
+    if (!this.config) return 0;
+    return invalidateEndpoint(this.config.apiKey, endpoint);
+  }
 
-  /**
-   * Clear all cached patches
-   */
-  clearCache(): number {
-    return clearPatchCache();
-  },
+  clearCache(): number { return clearPatchCache(); }
 
-  /**
-   * Disable Poly entirely (kill switch)
-   */
-  disable(): void {
-    disabled = true;
-  },
+  getCacheStats(): { size: number; totalHits: number; maxSize: number; ttlMs: number } { return getCacheStats(); }
 
-  /**
-   * Re-enable Poly
-   */
-  enable(): void {
-    disabled = false;
-  },
+  configureCache(options: { maxSize?: number; ttlMs?: number }): void { configureCache(options); }
 
-  /**
-   * Check if Poly is disabled
-   */
-  isDisabled(): boolean {
-    return isDisabled();
-  },
+  getCacheConfig(): { maxSize: number; ttlMs: number } { return getCacheConfig(); }
 
-  /**
-   * Subscribe to events: "drift" | "patch" | "error"
-   */
+  // ─── Kill switch ───
+  disable(): void { this.disabled = true; }
+  enable(): void { this.disabled = false; }
+  isPolyDisabled(): boolean { return this.isDisabled(); }
+
+  // ─── Events ───
   on(event: string, callback: Listener): void {
-    if (!listeners.has(event)) listeners.set(event, []);
-    listeners.get(event)!.push(callback);
-  },
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event)!.push(callback);
+  }
 
-  /**
-   * Unsubscribe from events
-   */
   off(event: string, callback: Listener): void {
-    const cbs = listeners.get(event);
+    const cbs = this.listeners.get(event);
     if (cbs) {
       const idx = cbs.indexOf(callback);
       if (idx > -1) cbs.splice(idx, 1);
     }
-  },
+  }
 
-  /**
-   * Rollback a previously applied patch (marks it as rolled back)
-   */
+  // ─── Misc ───
   async rollback(patchId: string): Promise<void> {
-    // In a real implementation, this would notify the cloud
     console.log(`[Poly] Rollback requested for patch: ${patchId}`);
-  },
+  }
 
-  /**
-   * Get the current baseline schema for an endpoint
-   */
   getBaseline(endpoint: string): SchemaField[] | null {
-    return baselineSchemas.get(endpoint) || null;
-  },
+    return this.baselineSchemas.get(endpoint) || null;
+  }
 
-  /**
-   * Get cache statistics
-   */
-  getCacheStats(): { size: number; totalHits: number; maxSize: number; ttlMs: number } {
-    return getCacheStats();
-  },
+  // ══════════════════════════════════════
+  // INTERNAL
+  // ══════════════════════════════════════
 
-  /**
-   * Configure cache limits (max entries + TTL)
-   * @example Poly.configureCache({ maxSize: 1000, ttlMs: 60 * 60 * 1000 }) // 1000 entries, 1 hour TTL
-   */
-  configureCache(options: { maxSize?: number; ttlMs?: number }): void {
-    configureCache(options);
-  },
+  private async handleFetchResponse(
+    requestConfig: Record<string, unknown>,
+    responseData: unknown
+  ): Promise<unknown | null> {
+    if (!this.config || this.isDisabled()) return null;
+    if (!responseData || typeof responseData !== "object") return null;
 
-  /**
-   * Get current cache configuration
-   */
-  getCacheConfig(): { maxSize: number; ttlMs: number } {
-    return getCacheConfig();
-  },
-};
+    const url = (requestConfig.url as string) || "";
+    const method = ((requestConfig.method as string) || "GET").toUpperCase();
 
-// ─── INTERNAL ──────────────────────────────────────────────
+    try {
+      const currentSchema = inferSchema(responseData);
+      const endpoint = this.extractEndpoint(url);
 
-/**
- * Handle response for fetch — returns patched data if drift was fixed, null if no changes.
- * Unlike handleResponse (axios, mutates in-place), this returns a new object.
- */
-async function handleFetchResponse(
-  requestConfig: Record<string, unknown>,
-  responseData: unknown
-): Promise<unknown | null> {
-  if (!config || isDisabled()) return null;
-  if (!responseData || typeof responseData !== "object") return null;
+      if (!this.baselineSchemas.has(endpoint)) {
+        this.baselineSchemas.set(endpoint, currentSchema);
+        return null;
+      }
 
-  const url = (requestConfig.url as string) || "";
-  const method = ((requestConfig.method as string) || "GET").toUpperCase();
+      const expectedSchema = this.baselineSchemas.get(endpoint)!;
+      const driftResults = detectDrift(expectedSchema, currentSchema);
+      if (driftResults.length === 0) return null;
 
-  try {
-    const currentSchema = inferSchema(responseData);
-    const endpoint = extractEndpoint(url);
+      for (const drift of driftResults) {
+        const event: DriftEvent = {
+          type: drift.type as DriftEvent["type"], path: drift.path,
+          expected: drift.expected, actual: drift.actual,
+          severity: drift.severity, timestamp: Date.now(),
+        };
+        this.emit("drift", event);
+        if (this.config.onDrift) this.config.onDrift(event);
+      }
 
-    if (!baselineSchemas.has(endpoint)) {
-      baselineSchemas.set(endpoint, currentSchema);
-      return null;
-    }
+      const sig = JSON.stringify(responseData).slice(0, 100);
+      const cacheKey = generateCacheKey(this.config.apiKey, method, this.extractHost(url), endpoint, sig);
+      const cached = getCachedPatch(cacheKey);
 
-    const expectedSchema = baselineSchemas.get(endpoint)!;
-    const driftResults = detectDrift(expectedSchema, currentSchema);
+      if (cached) {
+        if (!this.config.dryRun) return applyPatches(responseData, cached);
+        return null;
+      }
 
-    if (driftResults.length === 0) return null;
+      const result = await this.requestAnalysis(endpoint, method, expectedSchema, currentSchema);
+      if (!result || result.mapping.length === 0) {
+        // Cloud unreachable — queue for later
+        if (!result) this.enqueueOffline(endpoint, method, expectedSchema, currentSchema);
+        return null;
+      }
 
-    // Emit drift events
-    for (const drift of driftResults) {
-      const event: DriftEvent = {
-        type: drift.type as DriftEvent["type"],
-        path: drift.path,
-        expected: drift.expected,
-        actual: drift.actual,
-        severity: drift.severity,
-        timestamp: Date.now(),
-      };
-      emit("drift", event);
-      if (config.onDrift) config.onDrift(event);
-    }
+      setCachedPatch(cacheKey, this.config.apiKey, endpoint, result.mapping, result.confidence);
 
-    // Check cache
-    const responseSignature = JSON.stringify(responseData).slice(0, 100);
-    const cacheKey = generateCacheKey(config.apiKey, method, extractHost(url), endpoint, responseSignature);
-    const cachedPatches = getCachedPatch(cacheKey);
-
-    if (cachedPatches) {
-      if (!config.dryRun) {
-        const patched = applyPatches(responseData, cachedPatches);
+      if (result.confidence >= this.getConfidenceThreshold() && !this.config.dryRun) {
+        const patched = applyPatches(responseData, result.mapping);
+        for (const p of result.mapping) { this.emit("patch", p); if (this.config.onPatch) this.config.onPatch(p); }
+        if (result.autoPatch) this.baselineSchemas.set(endpoint, currentSchema);
         return patched;
       }
       return null;
-    }
-
-    // Cloud analysis
-    const analysisResult = await requestAnalysis(endpoint, method, expectedSchema, currentSchema);
-    if (!analysisResult || analysisResult.mapping.length === 0) return null;
-
-    setCachedPatch(cacheKey, config.apiKey, endpoint, analysisResult.mapping, analysisResult.confidence);
-
-    if (analysisResult.confidence >= getConfidenceThreshold() && !config.dryRun) {
-      const patched = applyPatches(responseData, analysisResult.mapping);
-      for (const patch of analysisResult.mapping) {
-        emit("patch", patch);
-        if (config.onPatch) config.onPatch(patch);
-      }
-      if (analysisResult.autoPatch) {
-        baselineSchemas.set(endpoint, currentSchema);
-      }
-      return patched;
-    }
-
-    return null;
-  } catch (error) {
-    emit("error", error instanceof Error ? error : new Error(String(error)));
-    if (config.onError) config.onError(error instanceof Error ? error : new Error(String(error)));
-    return null;
-  }
-}
-
-async function handleResponse(
-  requestConfig: Record<string, unknown>,
-  responseData: unknown
-): Promise<void> {
-  if (!config || isDisabled()) return;
-  if (!responseData || typeof responseData !== "object") return;
-
-  const url = (requestConfig.url as string) || "";
-  const method = ((requestConfig.method as string) || "GET").toUpperCase();
-
-  try {
-    // 1. Learn baseline schema
-    const currentSchema = inferSchema(responseData);
-    const endpoint = extractEndpoint(url);
-
-    if (!baselineSchemas.has(endpoint)) {
-      // First time seeing this endpoint — learn the baseline
-      baselineSchemas.set(endpoint, currentSchema);
-      return; // No drift on first observation
-    }
-
-    const expectedSchema = baselineSchemas.get(endpoint)!;
-
-    // 2. Detect drift
-    const driftResults = detectDrift(expectedSchema, currentSchema);
-
-    if (driftResults.length === 0) return; // No drift, all good
-
-    // 3. Emit drift events
-    for (const drift of driftResults) {
-      const event: DriftEvent = {
-        type: drift.type as DriftEvent["type"],
-        path: drift.path,
-        expected: drift.expected,
-        actual: drift.actual,
-        severity: drift.severity,
-        timestamp: Date.now(),
-      };
-      emit("drift", event);
-      if (config.onDrift) config.onDrift(event);
-    }
-
-    // 4. Check patch cache
-    const responseSignature = JSON.stringify(responseData).slice(0, 100);
-    const cacheKey = generateCacheKey(config.apiKey, method, extractHost(url), endpoint, responseSignature);
-    const cachedPatches = getCachedPatch(cacheKey);
-
-    if (cachedPatches) {
-      // Apply cached patches locally
-      if (!config.dryRun) {
-        Object.assign(responseData as Record<string,unknown>, applyPatches(responseData, cachedPatches) as Record<string,unknown>);
-      }
-      return;
-    }
-
-    // 5. Request analysis from Poly Cloud
-    const analysisResult = await requestAnalysis(
-      endpoint,
-      method,
-      expectedSchema,
-      currentSchema
-    );
-
-    if (!analysisResult || analysisResult.mapping.length === 0) return;
-
-    // 6. Cache the patches
-    setCachedPatch(cacheKey, config.apiKey, endpoint, analysisResult.mapping, analysisResult.confidence);
-
-    // 7. Apply patches if confidence is above threshold
-    if (analysisResult.confidence >= getConfidenceThreshold() && !config.dryRun) {
-      Object.assign(responseData as Record<string,unknown>, applyPatches(responseData, analysisResult.mapping) as Record<string,unknown>);
-
-      for (const patch of analysisResult.mapping) {
-        emit("patch", patch);
-        if (config.onPatch) config.onPatch(patch);
-      }
-    }
-
-    // 8. Update baseline if auto-patched successfully
-    if (analysisResult.autoPatch) {
-      baselineSchemas.set(endpoint, currentSchema);
-    }
-  } catch (error) {
-    emit("error", error instanceof Error ? error : new Error(String(error)));
-    if (config.onError) config.onError(error instanceof Error ? error : new Error(String(error)));
-  }
-}
-
-async function requestAnalysis(
-  endpoint: string,
-  method: string,
-  expected: SchemaField[],
-  actual: SchemaField[]
-): Promise<DriftAnalysisResponse | null> {
-  if (!config) return null;
-
-  try {
-    const response = await fetch(`${getEndpoint()}/api/analyze-drift`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Poly-API-Key": config.apiKey,
-      },
-      body: JSON.stringify({
-        tenantId: config.apiKey, // API key identifies the tenant
-        endpoint,
-        method,
-        expectedSchema: serializeSchema(expected),
-        actualSchema: serializeSchema(actual),
-        rules: config.rules || [],
-      }),
-    });
-
-    if (!response.ok) {
-      console.error(`[Poly] Analysis request failed: ${response.status}`);
+    } catch (error) {
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+      if (this.config?.onError) this.config.onError(error instanceof Error ? error : new Error(String(error)));
       return null;
     }
+  }
 
-    return await response.json() as DriftAnalysisResponse;
-  } catch (error) {
-    console.error("[Poly] Failed to reach Poly Cloud:", error);
-    return null;
+  private async handleResponse(
+    requestConfig: Record<string, unknown>,
+    responseData: unknown
+  ): Promise<void> {
+    if (!this.config || this.isDisabled()) return;
+    if (!responseData || typeof responseData !== "object") return;
+
+    const url = (requestConfig.url as string) || "";
+    const method = ((requestConfig.method as string) || "GET").toUpperCase();
+
+    try {
+      const currentSchema = inferSchema(responseData);
+      const endpoint = this.extractEndpoint(url);
+
+      if (!this.baselineSchemas.has(endpoint)) {
+        this.baselineSchemas.set(endpoint, currentSchema);
+        return;
+      }
+
+      const expectedSchema = this.baselineSchemas.get(endpoint)!;
+      const driftResults = detectDrift(expectedSchema, currentSchema);
+      if (driftResults.length === 0) return;
+
+      for (const drift of driftResults) {
+        const event: DriftEvent = {
+          type: drift.type as DriftEvent["type"], path: drift.path,
+          expected: drift.expected, actual: drift.actual,
+          severity: drift.severity, timestamp: Date.now(),
+        };
+        this.emit("drift", event);
+        if (this.config.onDrift) this.config.onDrift(event);
+      }
+
+      const sig = JSON.stringify(responseData).slice(0, 100);
+      const cacheKey = generateCacheKey(this.config.apiKey, method, this.extractHost(url), endpoint, sig);
+      const cached = getCachedPatch(cacheKey);
+
+      if (cached) {
+        if (!this.config.dryRun) {
+          Object.assign(responseData as Record<string,unknown>, applyPatches(responseData, cached) as Record<string,unknown>);
+        }
+        return;
+      }
+
+      const result = await this.requestAnalysis(endpoint, method, expectedSchema, currentSchema);
+      if (!result || result.mapping.length === 0) {
+        if (!result) this.enqueueOffline(endpoint, method, expectedSchema, currentSchema);
+        return;
+      }
+
+      setCachedPatch(cacheKey, this.config.apiKey, endpoint, result.mapping, result.confidence);
+
+      if (result.confidence >= this.getConfidenceThreshold() && !this.config.dryRun) {
+        Object.assign(responseData as Record<string,unknown>, applyPatches(responseData, result.mapping) as Record<string,unknown>);
+        for (const p of result.mapping) { this.emit("patch", p); if (this.config.onPatch) this.config.onPatch(p); }
+      }
+
+      if (result.autoPatch) this.baselineSchemas.set(endpoint, currentSchema);
+    } catch (error) {
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+      if (this.config?.onError) this.config.onError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async requestAnalysis(
+    endpoint: string, method: string,
+    expected: SchemaField[], actual: SchemaField[]
+  ): Promise<DriftAnalysisResponse | null> {
+    if (!this.config) return null;
+    try {
+      const response = await fetch(`${this.getEndpoint()}/api/analyze-drift`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Poly-API-Key": this.config.apiKey },
+        body: JSON.stringify({
+          tenantId: this.config.apiKey, endpoint, method,
+          expectedSchema: serializeSchema(expected),
+          actualSchema: serializeSchema(actual),
+          rules: this.config.rules || [],
+        }),
+      });
+      if (!response.ok) {
+        console.error(`[Poly] Analysis request failed: ${response.status}`);
+        return null;
+      }
+      return await response.json() as DriftAnalysisResponse;
+    } catch (error) {
+      console.error("[Poly] Failed to reach Poly Cloud:", error);
+      return null;
+    }
+  }
+
+  private extractEndpoint(url: string): string {
+    try { return new URL(url).pathname; } catch { return url; }
+  }
+
+  private extractHost(url: string): string {
+    try { return new URL(url).host; } catch { return "unknown"; }
+  }
+
+  // ─── Offline Queue ───
+
+  /** Number of pending offline drift events */
+  get pendingQueueSize(): number { return this.offlineQueue.length; }
+
+  /** Manually flush the offline queue (auto-flushes every 60s) */
+  async flushQueue(): Promise<number> {
+    if (this.flushing || this.offlineQueue.length === 0) return 0;
+    this.flushing = true;
+    let flushed = 0;
+    const batch = [...this.offlineQueue];
+    this.offlineQueue = [];
+
+    for (const item of batch) {
+      try {
+        const result = await this.requestAnalysis(item.endpoint, item.method, item.expected, item.actual);
+        if (result) flushed++;
+        else this.offlineQueue.push(item); // Re-queue if failed
+      } catch {
+        this.offlineQueue.push(item); // Re-queue on error
+      }
+    }
+    this.flushing = false;
+    return flushed;
+  }
+
+  private enqueueOffline(endpoint: string, method: string, expected: SchemaField[], actual: SchemaField[]): void {
+    if (this.offlineQueue.length >= this.queueMaxSize) this.offlineQueue.shift(); // Drop oldest
+    this.offlineQueue.push({ endpoint, method, expected, actual, timestamp: Date.now() });
+    // Auto-flush every 60s
+    if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => { this.flushQueue(); this.flushTimer = null; }, 60_000);
+    }
   }
 }
 
-function extractEndpoint(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return parsed.pathname;
-  } catch {
-    return url;
-  }
-}
+// ═══════════════════════════════════════════════
+// Static Poly — singleton + factory (backward compatible)
+// ═══════════════════════════════════════════════
+const defaultInstance = new PolyInstance();
 
-function extractHost(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return parsed.host;
-  } catch {
-    return "unknown";
-  }
-}
+export const Poly = {
+  /** Create a new independent Poly instance (for multi-tenant / multi-config use) */
+  createInstance(options?: PolyConfig): PolyInstance {
+    const instance = new PolyInstance();
+    if (options) instance.init(options);
+    return instance;
+  },
+
+  // ─── Delegated to default instance (backward compatible) ───
+  init: (o: PolyConfig) => defaultInstance.init(o),
+  wrap: (a: AxiosInstance) => defaultInstance.wrap(a),
+  wrapFetch: () => defaultInstance.wrapFetch(),
+  createFetch: () => defaultInstance.createFetch(),
+  unwrapFetch: () => defaultInstance.unwrapFetch(),
+  analyzeResponse: (c: Record<string, unknown>, d: unknown) => defaultInstance.analyzeResponse(c, d),
+  invalidateCache: (e: string) => defaultInstance.invalidateCache(e),
+  clearCache: () => defaultInstance.clearCache(),
+  getCacheStats: () => defaultInstance.getCacheStats(),
+  configureCache: (o: { maxSize?: number; ttlMs?: number }) => defaultInstance.configureCache(o),
+  getCacheConfig: () => defaultInstance.getCacheConfig(),
+  disable: () => defaultInstance.disable(),
+  enable: () => defaultInstance.enable(),
+  isDisabled: () => defaultInstance.isPolyDisabled(),
+  on: (e: string, c: Listener) => defaultInstance.on(e, c),
+  off: (e: string, c: Listener) => defaultInstance.off(e, c),
+  rollback: (id: string) => defaultInstance.rollback(id),
+  getBaseline: (e: string) => defaultInstance.getBaseline(e),
+  get pendingQueueSize() { return defaultInstance.pendingQueueSize; },
+  flushQueue: () => defaultInstance.flushQueue(),
+};
