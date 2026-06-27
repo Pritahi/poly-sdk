@@ -14,20 +14,28 @@ npm install github:Pritahi121/poly-sdk
 
 ## Quick Start
 
+### Axios
+
 ```typescript
-import { Poly } from "pritpolytt-sdk"
+import { Poly } from "poly-sdk"
 import axios from "axios"
 
-// 1. Initialize with your API key
-Poly.init({
-  apiKey: "poly_live_xxx"
-})
-
-// 2. Wrap your HTTP client
+Poly.init({ apiKey: "poly_live_xxx" })
 Poly.wrap(axios)
 
-// 3. Use your API normally — Poly handles everything else
 const { data } = await axios.get("https://api.example.com/users")
+```
+
+### Fetch
+
+```typescript
+import { Poly } from "poly-sdk"
+
+Poly.init({ apiKey: "poly_live_xxx" })
+Poly.wrapFetch()
+
+const res = await fetch("https://api.example.com/users")
+const data = await res.json()
 ```
 
 That's it. 3 lines. Poly automatically monitors, detects drift, and patches responses.
@@ -35,7 +43,7 @@ That's it. 3 lines. Poly automatically monitors, detects drift, and patches resp
 ## How It Works
 
 ```
-Your App → Poly SDK → Third-party API
+Your App → Poly SDK (axios or fetch) → Third-party API
 
 When drift occurs:
   Poly SDK → Poly Cloud (metadata only, never your data)
@@ -158,10 +166,31 @@ Poly.on("patch", (patch) => {
 
 | Client | Status |
 |--------|--------|
-| Axios | ✅ Supported |
-| fetch | 🔄 Coming Soon |
+| Axios | ✅ `Poly.wrap(axios)` |
+| fetch | ✅ `Poly.wrapFetch()` or `Poly.createFetch()` |
 | OpenAI SDK | 🔄 Coming Soon |
 | Stripe SDK | 🔄 Coming Soon |
+
+### Fetch Usage
+
+```typescript
+import { Poly } from "poly-sdk"
+
+Poly.init({ apiKey: "poly_live_xxx" })
+
+// Option 1: Replace global fetch
+Poly.wrapFetch()
+const res = await fetch("https://api.example.com/users")
+const data = await res.json() // drift-protected automatically
+
+// Option 2: Keep original fetch, use a wrapped copy
+const polyFetch = Poly.createFetch()
+const res2 = await polyFetch("https://api.example.com/users")
+// Original fetch remains untouched for other calls
+
+// Option 3: Undo wrapping
+Poly.unwrapFetch() // restores original global fetch
+```
 
 ## License
 

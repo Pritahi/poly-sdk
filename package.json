@@ -1,6 +1,6 @@
 {
   "name": "@Pritahi121/poly-sdk",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "Poly SDK — Survive third-party API changes. Detect schema drift, generate safe mappings, apply transformations locally.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

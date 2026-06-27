@@ -27,6 +27,7 @@ export interface SchemaField {
   nullable: boolean;
   isArray: boolean;
   children?: SchemaField[];
+  enumValues?: string[];
 }
 
 export type DriftType =
